@@ -1,0 +1,50 @@
+location: <LOCATION>
+name: <CONTAINER_APP_NAME>
+type: Microsoft.App/containerApps
+properties:
+  managedEnvironmentId: /subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>/providers/Microsoft.App/managedEnvironments/<CONTAINERAPPS_ENVIRONMENT>
+  configuration:
+    activeRevisionsMode: Single
+    ingress:
+      allowInsecure: false
+      external: true
+      targetPort: 8765
+      transport: auto
+      traffic:
+      - latestRevision: true
+        weight: 100
+    registries:
+    - server: <ACR_LOGIN_SERVER>
+      identity: system
+    secrets:
+    - name: azure-openai-api-key
+      value: <AZURE_OPENAI_API_KEY>
+  identity:
+    type: SystemAssigned
+  template:
+    containers:
+    - image: <ACR_LOGIN_SERVER>/acs-realtime-bridge:latest
+      name: bridge-server
+      env:
+      - name: AZURE_OPENAI_ENDPOINT
+        value: <AZURE_OPENAI_ENDPOINT>
+      - name: AZURE_OPENAI_DEPLOYMENT
+        value: <AZURE_OPENAI_DEPLOYMENT>
+      - name: AZURE_OPENAI_API_VERSION
+        value: "2025-04-01-preview"
+      - name: AZURE_OPENAI_API_KEY
+        secretRef: azure-openai-api-key
+      - name: BRIDGE_BIND_HOST
+        value: "0.0.0.0"
+      - name: BRIDGE_BIND_PORT
+        value: "8765"
+      - name: REALTIME_VOICE
+        value: "cedar"
+      - name: REALTIME_INSTRUCTIONS
+        value: "You are a friendly phone agent. Answer naturally, keep responses concise, and ask clarifying questions when needed."
+      resources:
+        cpu: 0.5
+        memory: 1Gi
+    scale:
+      minReplicas: 1
+      maxReplicas: 3
