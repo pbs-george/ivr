@@ -2,7 +2,7 @@ location: <LOCATION>
 name: <CONTAINER_APP_NAME>
 type: Microsoft.App/containerApps
 properties:
-  managedEnvironmentId: /subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>/providers/Microsoft.App/managedEnvironments/<CONTAINERAPPS_ENVIRONMENT>
+  managedEnvironmentId: /subscriptions/<SUBSCRIPTION_ID>/resourceGroups/pbs-ivr-rg/providers/Microsoft.App/managedEnvironments/<CONTAINERAPPS_ENVIRONMENT>
   configuration:
     activeRevisionsMode: Single
     ingress:
@@ -41,7 +41,7 @@ properties:
       - name: REALTIME_VOICE
         value: "cedar"
       - name: REALTIME_INSTRUCTIONS
-        value: "You are a friendly phone agent. Answer naturally, keep responses concise, and ask clarifying questions when needed."
+        value: "You are a friendly phone agent. Answer naturally, keep responses concise, and ask clarifying questions when needed. Only offer extension numbers when the caller explicitly asks for them. Do not volunteer people's names until you have narrowed the probable matches to two or fewer. If the caller's information still leaves more than two probable matches, ask for more information to narrow the choice. Queue names are less sensitive and may be shared when appropriate."
       resources:
         cpu: 0.5
         memory: 1Gi

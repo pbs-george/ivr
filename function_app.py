@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -12,6 +14,7 @@ from azure.communication.callautomation import (
     MediaStreamingOptions,
     StreamingTransportType,
 )
+
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -48,7 +51,16 @@ def _media_streaming_options() -> MediaStreamingOptions:
     )
 
 
-@app.route(route="incoming_call")
+def parse_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+@app.function_name(name="incoming_call")
+@app.route(route="incoming_call", methods=["POST"])
 def incoming_call(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("incoming_call invoked")
 
@@ -89,5 +101,13 @@ def incoming_call(req: func.HttpRequest) -> func.HttpResponse:
 
         if event_type == "Microsoft.Communication.CallConnected":
             return _json_response({"status": "media_streaming_requested"})
+
+        if event_type == "Microsoft.Communication.MediaStreamingFailed":
+            logging.warning("ACS reported MediaStreamingFailed: %s", json.dumps(event.get("data", {})))
+            return _json_response({"status": "media_streaming_failed"})
+
+        if event_type == "Microsoft.Communication.MediaStreamingStopped":
+            logging.info("ACS reported MediaStreamingStopped: %s", json.dumps(event.get("data", {})))
+            return _json_response({"status": "media_streaming_stopped"})
 
     return _json_response({"status": "ok"})

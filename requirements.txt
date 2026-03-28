@@ -1,8 +1,5 @@
-# Uncomment to enable Azure Monitor OpenTelemetry
-# Ref: aka.ms/functions-azure-monitor-python
-# azure-monitor-opentelemetry
-
-azure-functions
+requests>=2.28.0
+azure-functions>=1.21.0
 azure-communication-callautomation
 openai>=1.0.0
 websockets

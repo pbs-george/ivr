@@ -1,12 +1,13 @@
 import argparse
 import asyncio
-import base64
 import json
 import logging
 import os
 import ssl
+from typing import Any
 from urllib.parse import urlencode, urlparse
 
+import requests
 from websockets.datastructures import Headers
 from websockets.asyncio.client import ClientConnection, connect as ws_connect
 from websockets.asyncio.server import ServerConnection, serve
@@ -21,13 +22,160 @@ REALTIME_VOICE = os.environ.get("REALTIME_VOICE", "cedar").strip() or "cedar"
 REALTIME_INSTRUCTIONS = (
     os.environ.get(
         "REALTIME_INSTRUCTIONS",
-        "You are a friendly phone agent. Answer naturally, keep responses concise, "
-        "and ask clarifying questions when needed.",
+        "You are a friendly phone agent. Answer naturally, keep responses concise, and ask "
+        "clarifying questions when needed. Only offer extension numbers when the caller "
+        "explicitly asks for them. Do not volunteer people's names until you have narrowed "
+        "the probable matches to two or fewer. If the caller's information still leaves more "
+        "than two probable matches, ask for more information to narrow the choice. Queue names "
+        "are less sensitive and may be shared when appropriate.",
     ).strip()
-    or "You are a friendly phone agent. Answer naturally and keep responses concise."
+    or (
+        "You are a friendly phone agent. Answer naturally and keep responses concise. Only "
+        "offer extension numbers when explicitly asked. Do not volunteer people's names until "
+        "the probable matches are two or fewer."
+    )
 )
 BRIDGE_BIND_HOST = os.environ.get("BRIDGE_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0"
 BRIDGE_BIND_PORT = int(os.environ.get("BRIDGE_BIND_PORT", "8765"))
+PHONE_DIRECTORY_MCP_URL = (
+    os.environ.get("PHONE_DIRECTORY_MCP_URL", "https://pbs-common-mcp.azurewebsites.net/mcp").strip()
+)
+PHONE_DIRECTORY_MCP_PROTOCOL_VERSION = (
+    os.environ.get("PHONE_DIRECTORY_MCP_PROTOCOL_VERSION", "2025-03-26").strip() or "2025-03-26"
+)
+
+
+def _directory_lookup_is_configured() -> bool:
+    return bool(PHONE_DIRECTORY_MCP_URL)
+
+
+def _mcp_request_headers(*, session_id: str | None = None) -> dict[str, str]:
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    if session_id:
+        headers["mcp-session-id"] = session_id
+    return headers
+
+
+def _mcp_initialize_session() -> str:
+    response = requests.post(
+        PHONE_DIRECTORY_MCP_URL,
+        headers=_mcp_request_headers(),
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PHONE_DIRECTORY_MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "acs-realtime-bridge",
+                    "version": "1.0",
+                },
+            },
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    session_id = response.headers.get("mcp-session-id")
+    if not session_id:
+        raise RuntimeError("MCP server did not return an mcp-session-id header.")
+
+    initialized_response = requests.post(
+        PHONE_DIRECTORY_MCP_URL,
+        headers=_mcp_request_headers(session_id=session_id),
+        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        timeout=30,
+    )
+    initialized_response.raise_for_status()
+    return session_id
+
+
+def _mcp_extract_result(payload: dict[str, Any]) -> Any:
+    if "error" in payload:
+        raise RuntimeError(f"MCP request failed: {payload['error']}")
+
+    result = payload.get("result", {})
+    if result.get("isError"):
+        raise RuntimeError(f"MCP tool returned isError=true: {result}")
+
+    structured_content = result.get("structuredContent")
+    if structured_content is not None:
+        if isinstance(structured_content, dict) and set(structured_content) == {"result"}:
+            return structured_content["result"]
+        return structured_content
+
+    content = result.get("content", [])
+    if not content:
+        return result
+
+    if len(content) == 1 and content[0].get("type") == "text":
+        text = content[0].get("text", "")
+        if text:
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {"text": text}
+
+    return {"content": content}
+
+
+def _mcp_list_tools() -> list[dict[str, Any]]:
+    session_id = _mcp_initialize_session()
+    response = requests.post(
+        PHONE_DIRECTORY_MCP_URL,
+        headers=_mcp_request_headers(session_id=session_id),
+        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if "error" in payload:
+        raise RuntimeError(f"MCP tools/list failed: {payload['error']}")
+    result = payload.get("result", {})
+    tools = result.get("tools")
+    if not isinstance(tools, list):
+        raise RuntimeError("MCP tools/list response did not include a tools array.")
+    return tools
+
+
+def _mcp_call_tool(name: str, arguments: dict[str, Any]) -> Any:
+    session_id = _mcp_initialize_session()
+    response = requests.post(
+        PHONE_DIRECTORY_MCP_URL,
+        headers=_mcp_request_headers(session_id=session_id),
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments,
+            },
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return _mcp_extract_result(response.json())
+
+
+def _mcp_tool_to_realtime_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    name = str(tool.get("name") or "").strip()
+    if not name:
+        raise ValueError("MCP tool is missing a name.")
+
+    parameters = tool.get("inputSchema")
+    if not isinstance(parameters, dict):
+        parameters = {"type": "object", "properties": {}, "additionalProperties": True}
+
+    return {
+        "type": "function",
+        "name": name,
+        "description": str(tool.get("description") or f"MCP tool: {name}"),
+        "parameters": parameters,
+    }
 
 
 def _validate_config() -> None:
@@ -62,6 +210,7 @@ class RealtimeCallBridge:
         self._acs_websocket = acs_websocket
         self._call_connection_id = call_connection_id
         self._correlation_id = correlation_id
+        self._available_mcp_tool_names: set[str] = set()
         self._participant_raw_id: str | None = None
         self._assistant_audio_active = False
         self._outbound_audio_chunks = 0
@@ -69,8 +218,17 @@ class RealtimeCallBridge:
         self._pending_response_reason: str | None = None
         self._active_response_reason: str | None = None
         self._response_retry_counts: dict[str, int] = {}
+        self._response_requested_after_tool_output = False
+
+    def _should_ignore_speech_interrupt(self) -> bool:
+        return (
+            self._assistant_audio_active
+            and self._active_response_reason == "initial greeting"
+            and self._outbound_audio_chunks == 0
+        )
 
     async def run(self) -> None:
+        realtime_tools = await self._get_realtime_tools()
         async with ws_connect(
             _realtime_ws_url(),
             additional_headers={"api-key": AZURE_OPENAI_API_KEY},
@@ -94,6 +252,8 @@ class RealtimeCallBridge:
                             },
                             "input_audio_format": "pcm16",
                             "output_audio_format": "pcm16",
+                            "tool_choice": "auto",
+                            "tools": realtime_tools,
                         },
                     }
                 )
@@ -178,6 +338,12 @@ class RealtimeCallBridge:
 
             if event_type == "input_audio_buffer.speech_started":
                 logging.info("Realtime detected speech start for callConnectionId=%s", self._call_connection_id)
+                if self._should_ignore_speech_interrupt():
+                    logging.info(
+                        "Ignoring speech interrupt before first greeting audio for callConnectionId=%s",
+                        self._call_connection_id,
+                    )
+                    continue
                 if self._assistant_audio_active:
                     await realtime_ws.send(json.dumps({"type": "response.cancel"}))
                     logging.info(
@@ -246,7 +412,14 @@ class RealtimeCallBridge:
                         realtime_ws,
                         reason=self._active_response_reason,
                     )
+                elif self._response_requested_after_tool_output:
+                    self._response_requested_after_tool_output = False
+                    await self._request_realtime_audio_response(realtime_ws, reason="tool output")
                 self._active_response_reason = None
+                continue
+
+            if event_type == "response.function_call_arguments.done":
+                await self._handle_function_call(realtime_ws, event)
                 continue
 
             if event_type == "error":
@@ -275,6 +448,139 @@ class RealtimeCallBridge:
                 event_type,
                 self._call_connection_id,
             )
+
+    async def _get_realtime_tools(self) -> list[dict[str, Any]]:
+        if not _directory_lookup_is_configured():
+            self._available_mcp_tool_names = set()
+            return []
+
+        try:
+            mcp_tools = await asyncio.to_thread(_mcp_list_tools)
+        except Exception:  # noqa: BLE001
+            logging.exception(
+                "Failed to list MCP tools for callConnectionId=%s",
+                self._call_connection_id,
+            )
+            self._available_mcp_tool_names = set()
+            return []
+
+        realtime_tools: list[dict[str, Any]] = []
+        available_names: set[str] = set()
+        for tool in mcp_tools:
+            try:
+                realtime_tool = _mcp_tool_to_realtime_tool(tool)
+            except Exception:  # noqa: BLE001
+                logging.exception(
+                    "Failed to convert MCP tool definition for callConnectionId=%s tool=%r",
+                    self._call_connection_id,
+                    tool,
+                )
+                continue
+            realtime_tools.append(realtime_tool)
+            available_names.add(realtime_tool["name"])
+
+        self._available_mcp_tool_names = available_names
+        logging.info(
+            "Loaded %s MCP tools for callConnectionId=%s: %s",
+            len(realtime_tools),
+            self._call_connection_id,
+            sorted(available_names),
+        )
+        return realtime_tools
+
+    async def _handle_function_call(self, realtime_ws: ClientConnection, event: dict[str, Any]) -> None:
+        name = event.get("name")
+        call_id = event.get("call_id")
+        arguments_text = event.get("arguments", "{}")
+
+        logging.info(
+            "Realtime function call for callConnectionId=%s name=%s callId=%s",
+            self._call_connection_id,
+            name,
+            call_id,
+        )
+
+        if not call_id:
+            logging.warning(
+                "Ignoring function call without call_id for callConnectionId=%s name=%s",
+                self._call_connection_id,
+                name,
+            )
+            return
+
+        if name not in self._available_mcp_tool_names:
+            await self._send_function_call_output(
+                realtime_ws,
+                call_id=call_id,
+                payload={"ok": False, "error": f"Unsupported tool: {name}"},
+            )
+            self._response_requested_after_tool_output = True
+            return
+
+        try:
+            arguments = json.loads(arguments_text or "{}")
+            if not isinstance(arguments, dict):
+                raise ValueError("Tool arguments must be a JSON object.")
+        except Exception as exc:  # noqa: BLE001
+            await self._send_function_call_output(
+                realtime_ws,
+                call_id=call_id,
+                payload={"ok": False, "error": f"Invalid tool arguments: {exc}"},
+            )
+            self._response_requested_after_tool_output = True
+            return
+
+        result = await self._call_mcp_tool(name, arguments)
+        await self._send_function_call_output(realtime_ws, call_id=call_id, payload=result)
+        self._response_requested_after_tool_output = True
+
+    async def _send_function_call_output(
+        self,
+        realtime_ws: ClientConnection,
+        *,
+        call_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        await realtime_ws.send(
+            json.dumps(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps(payload),
+                    },
+                }
+            )
+        )
+
+    async def _call_mcp_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if not _directory_lookup_is_configured():
+            return {"ok": False, "error": "MCP tools are not configured on the bridge."}
+
+        try:
+            payload = await asyncio.to_thread(_mcp_call_tool, name, arguments)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception(
+                "MCP tool call failed for callConnectionId=%s tool=%s",
+                self._call_connection_id,
+                name,
+            )
+            return {
+                "ok": False,
+                "error": f"MCP tool call failed for {name}.",
+                "details": str(exc),
+                "tool": name,
+            }
+
+        logging.info(
+            "MCP tool call complete for callConnectionId=%s tool=%s",
+            self._call_connection_id,
+            name,
+        )
+        if isinstance(payload, dict):
+            return {"ok": True, **payload}
+        return {"ok": True, "result": payload}
 
     async def _send_audio_to_acs(self, audio_b64: str) -> None:
         if not audio_b64:
@@ -355,6 +661,15 @@ async def _process_request(_connection: ServerConnection, request: Request) -> R
 
 async def run_server() -> None:
     _validate_config()
+    if _directory_lookup_is_configured():
+        logging.info(
+            "MCP tool discovery enabled using server %s",
+            PHONE_DIRECTORY_MCP_URL,
+        )
+    else:
+        logging.info(
+            "Directory lookup tool disabled because PHONE_DIRECTORY_MCP_URL is not configured."
+        )
     async with serve(
         _handle_acs_connection,
         BRIDGE_BIND_HOST,

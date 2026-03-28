@@ -1,8 +1,8 @@
 **Overview**
 This repo now has two deployable parts:
 
-1. [`function_app.py`](/home/georgea/projects-wsl/ivr/code-incoming_call/function_app.py) as the Azure Function that answers ACS calls.
-2. [`bridge_server.py`](/home/georgea/projects-wsl/ivr/code-incoming_call/bridge_server.py) as the Azure Container Apps WebSocket bridge that relays audio between ACS and Azure OpenAI Realtime.
+1. [`function_app.py`] as the Azure Function that answers ACS calls.
+2. [`bridge_server.py`] as the Azure Container Apps WebSocket bridge that relays audio between ACS and Azure OpenAI Realtime.
 
 `ACS_MEDIA_STREAMING_URL` must point to the public `wss://...` URL of the container app bridge, not the Function App URL.
 
@@ -18,7 +18,7 @@ This repo now has two deployable parts:
 Set these variables first:
 
 ```bash
-RG="<resource-group>"
+RG="pbs-ivr-rg"
 LOCATION="<location>"
 ACR_NAME="<acr-name>"
 IMAGE_NAME="acs-realtime-bridge"
@@ -51,6 +51,7 @@ AZURE_OPENAI_ENDPOINT="https://<your-openai-resource>.cognitiveservices.azure.co
 AZURE_OPENAI_DEPLOYMENT="gpt-realtime-1.5"
 AZURE_OPENAI_API_KEY="<your-api-key>"
 REALTIME_VOICE="cedar"
+PHONE_DIRECTORY_MCP_URL="https://pbs-common-mcp.azurewebsites.net/mcp"
 ```
 
 Create the container app:
@@ -75,7 +76,8 @@ az containerapp create \
     BRIDGE_BIND_HOST="0.0.0.0" \
     BRIDGE_BIND_PORT="8765" \
     REALTIME_VOICE="$REALTIME_VOICE" \
-    REALTIME_INSTRUCTIONS="You are a friendly phone agent. Answer naturally, keep responses concise, and ask clarifying questions when needed." \
+    REALTIME_INSTRUCTIONS="You are a friendly phone agent. Answer naturally, keep responses concise, and ask clarifying questions when needed. Only offer extension numbers when the caller explicitly asks for them. Do not volunteer people's names until you have narrowed the probable matches to two or fewer. If the caller's information still leaves more than two probable matches, ask for more information to narrow the choice. Queue names are less sensitive and may be shared when appropriate." \
+    PHONE_DIRECTORY_MCP_URL="$PHONE_DIRECTORY_MCP_URL" \
   --secrets "azure-openai-api-key=$AZURE_OPENAI_API_KEY" \
   --secret-env-vars AZURE_OPENAI_API_KEY=azure-openai-api-key
 ```
@@ -87,6 +89,8 @@ az containerapp update \
   --name "$ACA_NAME" \
   --resource-group "$RG" \
   --image "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" \
+  --min-replicas 1 \
+  --max-replicas 3 \
   --set-env-vars \
     AZURE_OPENAI_ENDPOINT="$AZURE_OPENAI_ENDPOINT" \
     AZURE_OPENAI_DEPLOYMENT="$AZURE_OPENAI_DEPLOYMENT" \
@@ -94,7 +98,8 @@ az containerapp update \
     BRIDGE_BIND_HOST="0.0.0.0" \
     BRIDGE_BIND_PORT="8765" \
     REALTIME_VOICE="$REALTIME_VOICE" \
-    REALTIME_INSTRUCTIONS="You are a friendly phone agent. Answer naturally, keep responses concise, and ask clarifying questions when needed."
+    REALTIME_INSTRUCTIONS="You are a friendly phone agent. Answer naturally, keep responses concise, and ask clarifying questions when needed. Only offer extension numbers when the caller explicitly asks for them. Do not volunteer people's names until you have narrowed the probable matches to two or fewer. If the caller's information still leaves more than two probable matches, ask for more information to narrow the choice. Queue names are less sensitive and may be shared when appropriate." \
+    PHONE_DIRECTORY_MCP_URL="$PHONE_DIRECTORY_MCP_URL"
 ```
 
 If you need to refresh the secret too:
@@ -142,8 +147,106 @@ AZURE_OPENAI_API_VERSION=2025-04-01-preview
 
 in case you keep shared config values aligned across services.
 
+For MCP-backed tool use, the bridge container also needs:
+
+```text
+PHONE_DIRECTORY_MCP_URL=https://pbs-common-mcp.azurewebsites.net/mcp
+```
+
+**Deploy The Function App**
+For the current Flex Consumption Function App, deploy the Python app with zip deploy plus remote build.
+
+Set the Function App name:
+
+```bash
+FUNCTIONAPP_NAME="pbs-ivr-app"
+```
+
+Make sure the app's deployment storage exists and the app settings point to it. If the storage account is missing, recreate it:
+
+```bash
+DEPLOY_STORAGE_ACCOUNT="pbsivrrgbcaa"
+
+az storage account create \
+  --name "$DEPLOY_STORAGE_ACCOUNT" \
+  --resource-group "$RG" \
+  --location "$LOCATION" \
+  --sku Standard_LRS \
+  --kind StorageV2 \
+  --https-only true \
+  --allow-blob-public-access false
+```
+
+Update both storage-related app settings to use that account's connection string:
+
+```bash
+DEPLOY_STORAGE_CONNECTION_STRING="$(az storage account show-connection-string \
+  --name "$DEPLOY_STORAGE_ACCOUNT" \
+  --resource-group "$RG" \
+  -o tsv)"
+
+az functionapp config appsettings set \
+  --name "$FUNCTIONAPP_NAME" \
+  --resource-group "$RG" \
+  --settings \
+    AzureWebJobsStorage="$DEPLOY_STORAGE_CONNECTION_STRING" \
+    DEPLOYMENT_STORAGE_CONNECTION_STRING="$DEPLOY_STORAGE_CONNECTION_STRING"
+```
+
+Create the deployment container expected by Flex Consumption and restart the app once:
+
+```bash
+az storage container create \
+  --name "app-package-$FUNCTIONAPP_NAME-43a8dc4" \
+  --account-name "$DEPLOY_STORAGE_ACCOUNT" \
+  --connection-string "$DEPLOY_STORAGE_CONNECTION_STRING"
+
+az functionapp restart \
+  --name "$FUNCTIONAPP_NAME" \
+  --resource-group "$RG"
+```
+
+Package the Function App from the repo root:
+
+```bash
+zip -r /tmp/"$FUNCTIONAPP_NAME".zip . \
+  -x '.git/*' '.venv/*' '.vscode/*' '__pycache__/*' 'local.settings.json' 'test*' '*.pyc' 'function_app.py.AnswersCalls'
+```
+
+Deploy the package with remote build enabled:
+
+```bash
+az functionapp deployment source config-zip \
+  --resource-group "$RG" \
+  --name "$FUNCTIONAPP_NAME" \
+  --src /tmp/"$FUNCTIONAPP_NAME".zip \
+  --build-remote true
+```
+
+Verify only the expected function is active:
+
+```bash
+az functionapp function list \
+  --resource-group "$RG" \
+  --name "$FUNCTIONAPP_NAME" \
+  -o table
+```
+
+If you still see old disabled functions from a previous deployment, remove stale disable flags:
+
+```bash
+az functionapp config appsettings delete \
+  --name "$FUNCTIONAPP_NAME" \
+  --resource-group "$RG" \
+  --setting-names \
+    AzureWebJobs.match_ringcentral_directory.Disabled \
+    AzureWebJobs.refresh_ringcentral_directory.Disabled \
+    AzureWebJobs.refresh_ringcentral_directory_status.Disabled \
+    AzureWebJobs.refresh_ringcentral_directory_timer.Disabled
+```
+
 **Deploy Using YAML Instead**
-You can also start from [`aca-bridge.template.yaml`](/home/georgea/projects-wsl/ivr/code-incoming_call/aca-bridge.template.yaml), fill in the placeholders, and deploy with:
+You can also start from [`aca-bridge.template.yaml`](/home/georgea/projects-wsl/ivr/code-ivr/aca-bridge.template.yaml), fill in the placeholders, and deploy with:
 
 ```bash
 az containerapp create \
@@ -171,9 +274,19 @@ You want to see log lines indicating:
 - Realtime session created
 - Realtime session updated
 - Realtime response done
+5. Confirm the Function App only exposes the expected route:
+
+```bash
+az functionapp function list \
+  --resource-group "$RG" \
+  --name "$FUNCTIONAPP_NAME" \
+  -o table
+```
 
 **Notes**
 - Keep `minReplicas` at `1` if you want to avoid cold starts on live calls.
+- If you ever see `minReplicas` drift back to `0`, ACS can answer the call before the bridge finishes starting, which shows up as `MediaStreamingFailed` with silence to the caller.
 - The bridge uses WebSockets and should live in Container Apps or another WebSocket-friendly host, not inside the Function HTTP app.
+- The current Function App is on Flex Consumption, so Function deploys depend on the deployment storage account configured by `DEPLOYMENT_STORAGE_CONNECTION_STRING`.
 - The deployed bridge uses the same raw Azure OpenAI Realtime WebSocket protocol as [`test.py`](/home/georgea/projects-wsl/ivr/code-incoming_call/test.py).
 - Container Apps may still emit occasional probe-related WebSocket handshake noise in logs; that does not affect live call audio.
